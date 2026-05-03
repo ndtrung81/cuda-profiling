@@ -3,7 +3,9 @@
 This project contains educational ML training loop in Python that mirrors every best-practice
 criterion from the CUDA C example, using CuPy as the GPU backend.
 
-The workload is a simple deep learning network training:
+This set of scripts also demonstrates how to use **nsys** and **ncu** to detect and
+diagnose four common GPU training anti-patterns, using a simple 3-layer MLP on
+synthetic regression data:
 
 - Model: 3-layer MLP  (input → hidden1 → hidden2 → output)
 - Task:  Synthetic regression  (random X → random y)
@@ -26,6 +28,82 @@ The script `ml_training_cuda.py` implements the following criteria for optimizin
 Requirements
 ------------
     pip install cupy-cuda12x nvidia-ml-py tqdm
+
+---
+
+## A100 SXM4 — Key specs for profiling context
+
+| Property | Value |
+|----------|-------|
+| SMs | 108 |
+| CUDA cores (FP32) | 6912 |
+| FP64 CUDA cores | 3456 (half of FP32) |
+| Tensor Core units | 432 (4 per SM, 3rd gen) |
+| Boost clock | ~1.41 GHz |
+| HBM2e bandwidth | **2 TB/s** |
+| PCIe 4.0 bandwidth | ~64 GB/s |
+
+### Compute roofline ceilings
+
+The compute roof is derived from first principles (units × FLOP/unit/clock × boost clock) and depends on the data precision:
+
+| Precision | Active units | FLOP/unit/clock | Peak | Ridge point* |
+|-----------|-------------|-----------------|------|-------------|
+| FP64 scalar | 3456 cores | 2 | **9.7 TFLOP/s** | 4.9 FLOP/byte |
+| FP64 Tensor Core | 432 TCs | 256 (8×4×4, half-rate) | **19.5 TFLOP/s** | 9.8 FLOP/byte |
+| FP32 scalar | 6912 cores | 2 | **19.5 TFLOP/s** | 9.8 FLOP/byte |
+| TF32 Tensor Core | 432 TCs | 256 (8×4×4 tile) | **156 TFLOP/s** | 78 FLOP/byte |
+| FP16/BF16 Tensor Core | 432 TCs | 512 (8×4×8 tile) | **312 TFLOP/s** | 156 FLOP/byte |
+| FP16 with 2:4 sparsity | 432 TCs | 1024 | **624 TFLOP/s** | 312 FLOP/byte |
+
+For instance, A100 CUDA cores do 1 FP64 FMA per clock, but only half the CUDA cores are FP64-capable on A100 — 3456 FP64 cores (half of 6912):
+```
+FP64 peak = 3456 cores × 2 FLOP/FMA × 1.41 GHz
+           = 3456 × 2 × 1.41 × 10⁹
+           = 9.75 TFLOP/s  ≈ 9.7 TFLOP/s  
+```
+Since NVIDIA doesn't publish the exact tile dimensions for each precision publicly,
+these Tensor COres figures are reverse-engineered from the quoted TFLOP/s numbers
+and confirmed by microbenchmarks (e.g. Jia et al., 2021). Suppose that Nvidia's 3rd-gen TC on A100
+does a 8×4×4 tile for TF32 (not 4×4×4), then 
+```
+one TC per clock = 8×4×4 tile = 128 multiply-accumulates (FMA) = 256 FLOP
+```
+
+The peak values are then computed
+```
+TF32 peak = 432 TC × 256 FLOP/clock × 1.41 GHz
+           = 155.8 TFLOP/s  ≈ 156 TFLOP/s
+```
+and
+```
+FP16 peak = 432 TC × 512 FLOP/clock × 1.41 GHz
+           = 311.9 TFLOP/s  ≈ 312 TFLOP/s 
+```
+
+*Ridge point = peak TFLOP/s ÷ 2000 GB/s HBM2e bandwidth.
+Below the ridge point the kernel is memory-bandwidth-bound; above it,
+compute-bound. A typical large GEMM achieves ~100–200 FLOP/byte of arithmetic
+intensity, placing it right around the TF32 ridge — which is why enabling vs
+disabling TF32 Tensor Cores is so impactful on A100.
+
+**FP64 TC vs TF32 TC tile geometry note:** both use an 8×4×4 output tile
+(256 FLOP per TC per clock in principle), but the FP64 TC path runs at half
+the issue rate because each FP64 multiply requires twice the transistor cycles
+of TF32. This is why FP64 TC peaks at 19.5 TFLOP/s while TF32 TC peaks at
+156 TFLOP/s despite the same nominal tile size.
+
+### Minimum batch/dim sizing to fill all 108 SMs
+
+cuBLAS decomposes GEMMs into 128×128 output tiles, one tile per SM wave:
+
+```
+tiles = ceil(M/128) × ceil(N/128)  ≥  108  (one full SM wave)
+
+Recommended (≥ 2 waves):  tiles ≥ 216
+  batch=2048, H1=1024  →  16 ×  8 =  128 tiles  (~1.2 waves, marginal on A100)
+  batch=4096, H1=4096  →  32 × 32 = 1024 tiles  (~9.5 waves, good)
+```
 
 ---
 
@@ -74,6 +152,30 @@ ncu --set full --launch-count 4 -o v4_roof_ncu \
 ```
 
 ---
+## Baseline
+
+Run the script on a GPU node
+```
+python ml_training_cuda.py
+```
+
+and profiling it with `nsys`
+```
+nsys profile --trace=cuda,nvtx,osrt --stats=true -o ml_report python ml_training_cuda.py
+```
+
+Open the generated report `ml_report.nsys-rep` with `nsys-ui`
+```
+nsys-ui ml_report.nsys-rep
+```
+
+From the Timeline view, look at the **CUDA HW** row (or **Kernels** row).
+
+To profile with `ncu`, you need permission for performance counter sampling on the GPU node:
+```
+ncu --set full --launch-skip 4 --launch-count 8 -o baseline_ncu \
+    python ml_training_cuda.py
+```
 
 ## Anti-pattern 1 - Blocking I/O (`v1_io_gaps.py`)
 
@@ -119,8 +221,9 @@ loss_np = float((epoch_loss_gpu / n_batches).get()[0])
 tiles = ceil(M/128) × ceil(N/128)
       = ceil(batch/128) × ceil(H1/128)
 
-This script:  ceil(32/128) × ceil(64/128)  =  1 × 1  =  1 tile  → 1 SM
-Baseline:     ceil(2048/128) × ceil(1024/128) = 16 × 8 = 128 tiles → ~1 SM waves for A100 (108 SMs) or 2 SM waves for GP100 (56 SMs)
+This script:  ceil(32/128)  × ceil(64/128)   =  1 ×  1 =    1 tile  →  1 SM active
+Marginal:     ceil(2048/128) × ceil(1024/128) = 16 ×  8 =  128 tiles → ~1.2 SM waves
+Good:         ceil(4096/128) × ceil(4096/128) = 32 × 32 = 1024 tiles → ~9.5 SM waves
 ```
 
 **ncu — what to look for:**
@@ -132,23 +235,43 @@ ncu --metrics \
   sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_active \
   python ml_training_v2_sm_underutil.py
 ```
-- `launch__grid_size` → 1–4 blocks (should be hundreds)
-- `sm__warps_active` → < 5 % of peak
-- **Roofline chart** in `ncu-ui`: operating point is below *both* roofs — not
-  bandwidth-limited, not compute-limited; simply not enough parallelism.
+- `launch__grid_size` → 1–4 blocks (should be hundreds to thousands)
+- `launch__waves_per_multiprocessor` → < 1 (less than one full SM wave)
+- `sm__warps_active` → < 5% of peak
+- **Roofline chart** in ncu-ui: operating point is below *both* roofs — not
+  bandwidth-limited, not compute-limited; simply not enough parallelism to
+  reach either ceiling.
 
-**The fix:** ensure `batch × H1 ≥ n_SMs × tile²`.  For GP100:
-`batch=2048, H1=1024` → 128 tiles; `batch=16384, H1=4096` → 4096 tiles.
+**The fix:** ensure `batch × H1 ≥ n_SMs × tile²`.
+```python
+# BAD:  batch=32,   H1=64   →    1 tile  (1 SM active out of 108)
+# OK:   batch=2048, H1=1024 →  128 tiles (~1.2 SM waves, marginal on A100)
+# GOOD: batch=4096, H1=4096 → 1024 tiles (~9.5 SM waves)
+```
 
 ---
 
 ## Anti-pattern 3 — No Tensor Cores (`v3_no_tensor_cores.py`)
 
 **What is broken:**
-- (a) Weights are `float64` → cuBLAS selects a DGEMM kernel; Tensor Cores
-  require fp16/bf16/tf32, not fp64.
-- (b) Hidden dims are 100 and 60 (not multiples of 8) → even with fp32/fp16,
-  cuBLAS cannot fill Tensor Core warp tiles cleanly.
+- **(a) float64 weights** → cuBLAS selects a DGEMM path using FP64 Tensor Cores
+  at 19.5 TFLOP/s — versus TF32 TC at 156 TFLOP/s or FP16 TC at 312 TFLOP/s.
+  That is an 8–16× throughput penalty.
+- **(b) Hidden dims not multiples of 8** (H1=100, H2=60) → even with fp32,
+  cuBLAS cannot fill Tensor Core warp tiles cleanly and may fall back to
+  scalar FP32 CUDA cores (19.5 TFLOP/s) instead of TF32 TC (156 TFLOP/s).
+
+**A100 Tensor Core precision hierarchy:**
+
+| dtype input | TC path | Peak |
+|-------------|---------|------|
+| float64 | FP64 TC (3rd gen) | 19.5 TFLOP/s |
+| float32, TF32 disabled | FP32 scalar | 19.5 TFLOP/s |
+| float32, TF32 enabled (default) | TF32 TC | 156 TFLOP/s |
+| float16 / bfloat16 | FP16/BF16 TC | 312 TFLOP/s |
+
+TF32 is **enabled by default** in cuBLAS 11+ for fp32 inputs — you get it for
+free as long as dims are multiples of 4 (multiples of 64 for best efficiency).
 
 **GP100 note:** Pascal does not have Tensor Cores at all.  The comparison here
 is DGEMM (~5 TFLOP/s) vs SGEMM (~21 TFLOP/s).  On Volta/Ampere the gap is
@@ -157,34 +280,39 @@ much larger because fp16 Tensor Cores deliver 125–312 TFLOP/s.
 **ncu — what to look for:**
 ```bash
 ncu --metrics \
-  sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,\
+  sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_active,\
+  sm__pipe_tensor_op_dmma_cycles_active.avg.pct_of_peak_sustained_active \
+  python ml_training_v3_no_tensor_cores.py
+
+# Instruction mix — dfma should dominate; ffma/hfma should be 0
+ncu --metrics \
+  smsp__sass_thread_inst_executed_op_ffma_pred_on.sum,\
   smsp__sass_thread_inst_executed_op_dfma_pred_on.sum,\
-  smsp__sass_thread_inst_executed_op_ffma_pred_on.sum \
+  smsp__sass_thread_inst_executed_op_hfma_pred_on.sum \
   python ml_training_v3_no_tensor_cores.py
 ```
-- `sm__pipe_tensor_cycles_active` → 0 % (no Tensor Core activity)
-- `op_dfma` count → very high (double-precision FMAs)
-- `op_ffma` count → 0 (no single-precision FMAs)
+- `tensor_op_hmma` (fp16 TC) → 0%
+- `tensor_op_dmma` (fp64 TC) → active but at low throughput (19.5 TFLOP/s)
+- `op_dfma` instruction count → high;  `op_ffma` / `op_hfma` → 0
 
 **Roofline in ncu-ui:**
-- The FP64 roof (~5 TFLOP/s) is the relevant ceiling, not the FP32 roof.
-- Your operating point will be near or below the FP64 roof — the chart makes
-  visible how much headroom the FP32 and Tensor Core roofs have.
+- The relevant ceiling is the **FP64 TC roof at 19.5 TFLOP/s**.
+- The TF32 roof (156) and FP16 roof (312) will be visible but unreachable —
+  the chart makes the 8–16× headroom immediately apparent.
 
 **The fix:**
 ```python
-# BAD:
-self.W = cp.array(..., dtype=cp.float64)   # DGEMM, no Tensor Cores
+# BAD — hits FP64 TC roof (19.5 TFLOP/s), misaligned dims:
+self.W = cp.array(..., dtype=cp.float64)
+H1, H2 = 100, 60    # not multiples of 8
 
-# GOOD (fp32, SGEMM):
+# GOOD — TF32 TC (156 TFLOP/s), automatic with fp32 + aligned dims:
 self.W = cp.array(..., dtype=cp.float32)
+H1, H2 = 1024, 512  # multiples of 64 → full TC tile efficiency
 
-# GOOD (fp16 Tensor Cores, Volta+):
+# BETTER — FP16 TC (312 TFLOP/s), explicit cast:
 self.W = cp.array(..., dtype=cp.float16)
-
-# GOOD (dims — always multiples of 8, preferably 64):
-H1 = 1024   # not 100
-H2 = 512    # not 60
+H1, H2 = 1024, 512  # multiples of 8 required for fp16 TC
 ```
 
 ---
@@ -195,21 +323,23 @@ H2 = 512    # not 60
 
 | # | Issue | Extra bytes | Extra FLOPs |
 |---|-------|-------------|-------------|
-| a | Full dataset re-uploaded every epoch via PCIe | +250 MB/epoch | 0 |
-| b | Shuffle index array goes CPU→GPU every epoch | +256 KB/epoch | 0 |
-| c | Out-of-place weight updates allocate extra tensors | +2× weight traffic | 0 |
+| a | Full dataset re-uploaded every epoch via PCIe 4.0 | +dataset size/epoch | 0 |
+| b | Shuffle index built on CPU, transferred to GPU | +N×4 bytes/epoch | 0 |
+| c | Out-of-place weight updates allocate extra tensors | +2× weight size/step | 0 |
 
 All three add memory traffic without adding useful computation → arithmetic
-intensity (AI = FLOPs/byte) drops → operating point moves LEFT on roofline.
-PCIe is also ~45× slower than HBM2, so measured bandwidth also drops → point
-moves DOWN as well.  Result: far from both roofs.
+intensity (AI = FLOPs/byte) drops → operating point moves **left** on the
+roofline. PCIe 4.0 at ~64 GB/s is also **~31× slower** than HBM2e at 2 TB/s,
+so measured bandwidth drops too → point moves **down** as well.
+Result: far from both roofs.
 
 **nsys — what to look for:**
 1. Open `v4_roof.nsys-rep` → Timeline.
 2. Look at the **MemOps** / **DMA** row at the start of each epoch:
-   large teal bars (H→D) will dwarf the subsequent compute kernel bars.
-3. Compare compute time vs transfer time in **"CUDA API Statistics"**:
-   `cudaMemcpy` total time >> kernel total time.
+   large teal H→D bars will dwarf the compute kernel bars that follow.
+3. In **"CUDA API Statistics"**: `cudaMemcpy` total time >> kernel total time.
+4. The ratio of DMA time to kernel time directly quantifies the wasted epoch
+   time on PCIe transfers.
 
 **ncu — what to look for:**
 ```bash
@@ -220,59 +350,96 @@ ncu --metrics \
   l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum.per_second \
   python ml_training_v4_roofline_gap.py
 ```
-- **Roofline chart**: operating point far left (low AI) AND below the memory
-  bandwidth slope (PCIe bottleneck reduces effective HBM utilisation).
-- `l1tex` global load bandwidth will be low — data is not resident in L2
-  when it arrives from PCIe, bypassing the cache hierarchy.
+- **Roofline chart**: operating point far left (low AI) AND below the HBM2e
+  bandwidth slope — PCIe transfers reduce effective HBM utilisation because
+  data bypasses the L2 cache on arrival.
+- `l1tex` global load bandwidth: lower than HBM2e peak — cache hierarchy is
+  cold every epoch since data originates from the host.
 
 **The fix:**
 ```python
 # BAD — inside epoch loop:
-X_dev = cp.array(X_host)          # PCIe every epoch
+X_dev = cp.array(X_host)            # 64 GB/s PCIe, every epoch
 perm_cpu = np.random.permutation(n)
-X_shuf = X_dev[cp.array(perm_cpu)]  # perm crosses PCIe too
-self.W = self.W - lr * self.dW    # out-of-place: 2× allocations
+X_shuf = X_dev[cp.array(perm_cpu)]  # index array crosses PCIe too
+self.W = self.W - lr32 * self.dW    # out-of-place: 2× allocations
 
 # GOOD — upload once before loop:
-X_dev = cp.array(X_host)          # PCIe once
+X_dev = cp.array(X_host)            # PCIe once only
 # inside loop:
-perm = cp.random.permutation(n)   # stays on GPU
+perm   = cp.random.permutation(n)   # stays on HBM2e (2 TB/s)
 X_shuf = X_dev[perm]
-self.W -= lr * self.dW            # in-place: no extra allocation
+self.W -= lr32 * self.dW            # in-place: no extra allocation
 ```
 
 ---
 
 ## Side-by-side metric summary
 
-| Script | GPU idle gaps | SM util | Tensor Cores | Roofline AI |
-|--------|--------------|---------|--------------|-------------|
-| baseline | minimal | high | active (fp32) | near compute roof |
-| v1_io_gaps | **large (per batch)** | low | active | moderate |
-| v2_sm_underutil | moderate | **< 5 %** | active | below both roofs |
-| v3_no_tensor_cores | minimal | moderate | **0 %** | near FP64 roof |
-| v4_roofline_gap | minimal (compute) | moderate | active | **far below both** |
+| Script | GPU idle gaps | SM util | Tensor Cores | Roofline position |
+|--------|--------------|---------|--------------|-------------------|
+| baseline | minimal | high | TF32 TC active | near TF32 compute roof (156 TFLOP/s) |
+| v1_io_gaps | **large (per batch)** | low | TF32 TC active | moderate |
+| v2_sm_underutil | moderate | **< 5%** | TF32 TC active | below both roofs (parallelism-starved) |
+| v3_no_tensor_cores | minimal | moderate | **FP64 TC only** | near FP64 roof (19.5 TFLOP/s, 8× below TF32) |
+| v4_roofline_gap | minimal (compute) | moderate | TF32 TC active | **far below both** (PCIe bottleneck) |
 
 ---
 
-## Useful ncu metric cheat sheet
+## Useful ncu metric cheat sheet (A100 / ncu 12.2+)
 
 ```bash
 # SM and warp occupancy
-ncu --metrics sm__warps_active.avg.pct_of_peak_sustained_active,\
-achieved_occupancy
+ncu --metrics \
+  sm__warps_active.avg.pct_of_peak_sustained_active,\
+  sm__achieved_occupancy_pct
 
-# Tensor Core utilisation
-ncu --metrics sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active
+# Tensor Core utilisation — per precision (A100 3rd-gen TC)
+ncu --metrics \
+  sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_active,\
+  sm__pipe_tensor_op_dmma_cycles_active.avg.pct_of_peak_sustained_active
 
-# Instruction mix (fp32 vs fp64 vs fp16)
-ncu --metrics smsp__sass_thread_inst_executed_op_ffma_pred_on.sum,\
-smsp__sass_thread_inst_executed_op_dfma_pred_on.sum,\
-smsp__sass_thread_inst_executed_op_hfma_pred_on.sum
+# Instruction mix (fp32 scalar vs fp64 scalar vs fp16 TC)
+ncu --metrics \
+  smsp__sass_thread_inst_executed_op_ffma_pred_on.sum,\
+  smsp__sass_thread_inst_executed_op_dfma_pred_on.sum,\
+  smsp__sass_thread_inst_executed_op_hfma_pred_on.sum
 
-# Memory bandwidth
-ncu --metrics dram__bytes_read.sum.per_second,dram__bytes_write.sum.per_second
+# HBM2e bandwidth
+ncu --metrics \
+  dram__bytes_read.sum.per_second,\
+  dram__bytes_write.sum.per_second
 
-# Grid / launch dims
-ncu --metrics launch__grid_size,launch__block_size,launch__waves_per_multiprocessor
+# L2 cache hit rate
+ncu --metrics \
+  lts__t_sector_hit_rate.pct
+
+# Grid / launch dims and SM waves
+ncu --metrics \
+  launch__grid_size,\
+  launch__block_size,\
+  launch__waves_per_multiprocessor
+
+# Arithmetic intensity (compute yourself from these two)
+ncu --metrics \
+  smsp__sass_thread_inst_executed_op_ffma_pred_on.sum,\
+  dram__bytes.sum
+# AI = (ffma_count × 2) / dram_bytes
+```
+
+### ncu baseline comparison workflow
+
+```bash
+# 1. Profile the baseline
+ncu --set full --launch-skip 4 --launch-count 8 -o baseline_ncu \
+    python ml_training_cuda.py
+
+# 2. Profile an anti-pattern variant
+ncu --set full --launch-skip 4 --launch-count 8 -o v3_ncu \
+    python ml_training_v3_no_tensor_cores.py
+
+# 3. Open both in ncu-ui
+#    Right-click baseline_ncu → "Set as Baseline"
+#    All metrics in v3_ncu now show % delta vs baseline — immediately
+#    visible how much throughput the anti-pattern costs.
 ```
