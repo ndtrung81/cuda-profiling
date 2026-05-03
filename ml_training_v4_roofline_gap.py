@@ -120,7 +120,7 @@ _relu_backward_fused = cp.ElementwiseKernel(
 class LinearLayer:
     def __init__(self, fan_in, fan_out, stream):
         self.stream = stream
-        std = np.sqrt(2.0 / fan_in)
+        std = np.float32(np.sqrt(2.0 / fan_in))
         with stream:
             self.W = cp.array(
                 np.random.randn(fan_in, fan_out).astype(np.float32) * std)

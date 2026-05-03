@@ -45,16 +45,7 @@ Requirements
 
 ### Compute roofline ceilings
 
-The compute roof is derived from first principles (units × FLOP/unit/clock × boost clock) and depends on the data precision:
-
-| Precision | Active units | FLOP/unit/clock | Peak | Ridge point* |
-|-----------|-------------|-----------------|------|-------------|
-| FP64 scalar | 3456 cores | 2 | **9.7 TFLOP/s** | 4.9 FLOP/byte |
-| FP64 Tensor Core | 432 TCs | 256 (8×4×4, half-rate) | **19.5 TFLOP/s** | 9.8 FLOP/byte |
-| FP32 scalar | 6912 cores | 2 | **19.5 TFLOP/s** | 9.8 FLOP/byte |
-| TF32 Tensor Core | 432 TCs | 256 (8×4×4 tile) | **156 TFLOP/s** | 78 FLOP/byte |
-| FP16/BF16 Tensor Core | 432 TCs | 512 (8×4×8 tile) | **312 TFLOP/s** | 156 FLOP/byte |
-| FP16 with 2:4 sparsity | 432 TCs | 1024 | **624 TFLOP/s** | 312 FLOP/byte |
+The compute roof is derived from first principles (units × FLOP/unit/clock × boost clock) and depends on the data precision.
 
 For instance, A100 CUDA cores do 1 FP64 FMA per clock, but only half the CUDA cores are FP64-capable on A100 — 3456 FP64 cores (half of 6912):
 ```
@@ -63,7 +54,7 @@ FP64 peak = 3456 cores × 2 FLOP/FMA × 1.41 GHz
            = 9.75 TFLOP/s  ≈ 9.7 TFLOP/s  
 ```
 Since NVIDIA doesn't publish the exact tile dimensions for each precision publicly,
-these Tensor COres figures are reverse-engineered from the quoted TFLOP/s numbers
+these Tensor Cores figures are reverse-engineered from the quoted TFLOP/s numbers
 and confirmed by microbenchmarks (e.g. Jia et al., 2021). Suppose that Nvidia's 3rd-gen TC on A100
 does a 8×4×4 tile for TF32 (not 4×4×4), then 
 ```
@@ -81,7 +72,25 @@ FP16 peak = 432 TC × 512 FLOP/clock × 1.41 GHz
            = 311.9 TFLOP/s  ≈ 312 TFLOP/s 
 ```
 
-*Ridge point = peak TFLOP/s ÷ 2000 GB/s HBM2e bandwidth.
+The following table summarizes the compute roof (the flat lines in the roofline charts):
+
+| Precision | Active units | FLOP/unit/clock | Peak | Ridge point* |
+|-----------|-------------|-----------------|------|-------------|
+| FP64 scalar | 3456 cores | 2 | **9.7 TFLOP/s** | 4.9 FLOP/byte |
+| FP64 Tensor Core | 432 TCs | 256 (8×4×4, half-rate) | **19.5 TFLOP/s** | 9.8 FLOP/byte |
+| FP32 scalar | 6912 cores | 2 | **19.5 TFLOP/s** | 9.8 FLOP/byte |
+| TF32 Tensor Core | 432 TCs | 256 (8×4×4 tile) | **156 TFLOP/s** | 78 FLOP/byte |
+| FP16/BF16 Tensor Core | 432 TCs | 512 (8×4×8 tile) | **312 TFLOP/s** | 156 FLOP/byte |
+| FP16 with 2:4 sparsity | 432 TCs | 1024 | **624 TFLOP/s** | 312 FLOP/byte |
+
+
+### Ridge point: Compute-bound vs Memory-bound kernels.
+
+The memory bandwidth roof is the linear relationship between the peak performance (TFOP/s)
+and arithmetic intensity (FLOP/byte), the slope is the theoretical memory bandwidth (GB/s)
+of the GPU, i.e. 2000 GB/s for HBM2e.
+
+Where the compute roof meets the memory bandwidth roof determines the ridge point.
 Below the ridge point the kernel is memory-bandwidth-bound; above it,
 compute-bound. A typical large GEMM achieves ~100–200 FLOP/byte of arithmetic
 intensity, placing it right around the TF32 ridge — which is why enabling vs
