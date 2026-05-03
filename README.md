@@ -146,18 +146,40 @@ nsys profile --trace=cuda,nvtx,osrt --stats=true -o v1_io \
 # Anti-pattern 2 - SM underutilisation
 nsys profile --trace=cuda,nvtx,osrt --stats=true -o v2_sm \
      python ml_training_v2_sm_underutil.py
-ncu --set full --launch-count 4 -o v2_sm_ncu \
+ncu --set full --kernel-name regex:gemm --launch-count 100 -o v2_sm_ncu \
      python ml_training_v2_sm_underutil.py
 
-# Anti-pattern 3 - No Tensor Cores
-ncu --set full --launch-count 4 -o v3_tc_ncu \
+# Anti-pattern 3 — No Tensor Cores
+ncu --set full --kernel-name regex:gemm --launch-count 100 -o v3_tc_ncu \
      python ml_training_v3_no_tensor_cores.py
 
 # Anti-pattern 4 - Roofline gap
 nsys profile --trace=cuda,nvtx,osrt --stats=true -o v4_roof \
      python ml_training_v4_roofline_gap.py
-ncu --set full --launch-count 4 -o v4_roof_ncu \
+ncu --set full --kernel-name regex:gemm --launch-count 100 -o v4_roof_ncu \
      python ml_training_v4_roofline_gap.py
+```
+
+**ncu runtime tip:** ncu replays each kernel multiple times to collect all
+hardware counter sets, making a full training run 10–100× slower than normal.
+CuPy also has significant initialisation overhead (memory pool setup, cuBLAS handle
+creation, JIT compilation) that produces many launches before the first real GEMM
+appears — so a small `--launch-skip` is not reliable.
+
+The recommended approach is to filter by kernel name, which skips all CuPy
+housekeeping kernels and targets only the cuBLAS GEMMs you care about:
+
+```bash
+# Capture all GEMM kernel types (forward + backward passes)
+ncu --set full --kernel-name regex:gemm --launch-count 100 -o out python script.py
+```
+
+`regex:gemm` matches `ampere_sgemm_*`, `ampere_h16816gemm_*` (TF32 TC),
+`cutlass_*gemm*`, etc. — everything cuBLAS dispatches for `cp.matmul()` calls.
+If you also want to profile the elementwise kernels, add a second pass:
+
+```bash
+ncu --set full --kernel-name regex:cupy --launch-count 4 -o out_ew python script.py
 ```
 
 ---
@@ -353,8 +375,7 @@ Result: far from both roofs.
 **ncu — what to look for:**
 ```bash
 ncu --metrics \
-  dram__bytes_read.sum,\
-  dram__bytes_write.sum,\
+  dram__bytes.sum,\
   sm__cycles_elapsed.avg,\
   l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum.per_second \
   python ml_training_v4_roofline_gap.py
@@ -440,11 +461,11 @@ ncu --metrics \
 
 ```bash
 # 1. Profile the baseline
-ncu --set full --launch-skip 4 --launch-count 8 -o baseline_ncu \
+ncu --set full --kernel-name regex:gemm --launch-count 100 -o baseline_ncu \
     python ml_training_cuda.py
 
 # 2. Profile an anti-pattern variant
-ncu --set full --launch-skip 4 --launch-count 8 -o v3_ncu \
+ncu --set full --kernel-name regex:gemm --launch-count 100 -o v3_ncu \
     python ml_training_v3_no_tensor_cores.py
 
 # 3. Open both in ncu-ui
