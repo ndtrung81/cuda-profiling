@@ -124,7 +124,7 @@ class LinearLayer:
     def __init__(self, fan_in: int, fan_out: int, stream: cp.cuda.Stream):
         self.stream = stream
 
-        # He initialisation — keeps gradient magnitude stable through depth
+        # initialization — keeps gradient magnitude stable through depth
         std = cp.sqrt(cp.array(2.0 / fan_in, dtype=cp.float32))
         with stream:
             # C5 commentary: if we managed SMEM manually we would allocate
