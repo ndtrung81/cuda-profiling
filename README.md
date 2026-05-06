@@ -3,7 +3,7 @@
 This project contains educational ML training loop in Python that mirrors every best-practice
 criterion from the CUDA C example, using CuPy as the GPU backend.
 
-This set of scripts also demonstrates how to use **nsys** and **ncu** to detect and
+NVIDIA NSight profiling tools **nsys** and **ncu** are eused to detect and
 diagnose four common GPU training anti-patterns, using a simple 3-layer MLP on
 synthetic regression data:
 
@@ -16,7 +16,7 @@ The script `ml_training_cuda.py` implements the following criteria for optimizin
 
 | Criteria |  Goal  | Notes |
 |--------|-------------|--------------|
-|  C1 | Minimise host↔device transfers | dataset pinned & uploaded once at startup; only scalar loss is pulled back per epoch |
+|  C1 | Minimize host↔device transfers | dataset pinned & uploaded once at startup; only scalar loss is pulled back per epoch |
 |  C2 | Coalesced memory access | all weight/activation matrices are                        row-major (CuPy default); matmul reads  contiguous rows → full cache lines |
 |  C3 | Shared-memory prefetch | cuBLAS (used by cp.matmul) tiles GEMM internally; we expose this via streams |
 |  C4 | Maximise SM occupancy | large batch size fills the GPU; we query and print achieved occupancy via nvml |
@@ -28,6 +28,11 @@ The script `ml_training_cuda.py` implements the following criteria for optimizin
 Requirements
 ------------
     pip install cupy-cuda12x nvidia-ml-py tqdm
+
+References:
+
+- NVIDIA NSight Systems User Guide: https://docs.nvidia.com/nsight-systems/UserGuide/index.html
+- NVIDIA NSight Compute User Guide: https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html
 
 ---
 
@@ -86,11 +91,11 @@ The following table summarizes the compute roof (the flat lines in the roofline 
 
 ### Ridge point: Compute-bound vs Memory-bound kernels.
 
-The memory bandwidth roof is the linear relationship between the peak performance (TFOP/s)
+The memory bandwidth roof is the linear relationship between the peak performance (TFLOP/s)
 and arithmetic intensity (FLOP/byte), the slope is the theoretical memory bandwidth (GB/s)
 of the GPU, i.e. 2000 GB/s for HBM2e.
 
-Where the compute roof meets the memory bandwidth roof determines the ridge point.
+The ridge point is the point at which the memory bandwidth boundary meets the peak performance boundary.
 Below the ridge point the kernel is memory-bandwidth-bound; above it,
 compute-bound. A typical large GEMM achieves ~100–200 FLOP/byte of arithmetic
 intensity, placing it right around the TF32 ridge — which is why enabling vs
@@ -135,26 +140,43 @@ synthetic regression data.
 ## Quick-start: profile all variants
 
 ```bash
+# Common nsys flags
+NSYS_FLAGS="--trace=cuda,nvtx,cudnn,cublas \
+            --cuda-memory-usage=true \
+            --gpu-metrics-device=all \
+            --force-overwrite=true \
+            --delay=10"
+            
+
+| Flag | What it adds |
+|------|-------------|
+| `--trace=cuda,nvtx,cudnn,cublas` | CUDA kernels + NVTX ranges + cuDNN and cuBLAS API calls — maps kernels back to model operations |
+| `--trace=...,osrt` | OS Runtime: `write`/`fsync`/`pthread` syscalls — add only for v1 to see filesystem stalls |
+| `--cuda-memory-usage=true` | GPU memory allocation/free timeline — spots unexpected mid-loop allocations and peak memory spikes |
+| `--gpu-metrics-device=all` | Continuous hardware-sampled metrics: SM active rate, memory bandwidth, NVLink, **Tensor Core Activity** — visible as line charts in the GPU Metrics rows in nsys-ui |
+| `--force-overwrite=true` | Overwrites existing report files — convenient for iterative profiling |
+| `--delay=10` | Collection start after 10 seconds delay to exclude the warming up stage |
+
 # Baseline
 nsys profile --trace=cuda,nvtx,osrt --stats=true -o baseline \
      python ml_training_cuda.py
 
 # Anti-pattern 1 - I/O gaps
-nsys profile --trace=cuda,nvtx,osrt --stats=true -o v1_io \
+nsys profile $NSYS_FLAGS --trace=cuda,nvtx,cudnn,cublas,osrt -o v1_io \
      python ml_training_v1_io_gaps.py
 
 # Anti-pattern 2 - SM underutilisation
-nsys profile --trace=cuda,nvtx,osrt --stats=true -o v2_sm \
-     python ml_training_v2_sm_underutil.py
+nsys profile  $NSYS_FLAGS -o v2_sm python ml_training_v2_sm_underutil.py
 ncu --set full --kernel-name regex:gemm --launch-count 100 -o v2_sm_ncu \
      python ml_training_v2_sm_underutil.py
 
 # Anti-pattern 3 — No Tensor Cores
+nsys profile $NSYS_FLAGS -o v3_notc python ml_training_v3_no_tensor_cores.py
 ncu --set full --kernel-name regex:gemm --launch-count 100 -o v3_tc_ncu \
      python ml_training_v3_no_tensor_cores.py
 
 # Anti-pattern 4 - Roofline gap
-nsys profile --trace=cuda,nvtx,osrt --stats=true -o v4_roof \
+nsys profile  $NSYS_FLAGS -o v4_roof \
      python ml_training_v4_roofline_gap.py
 ncu --set full --kernel-name regex:gemm --launch-count 100 -o v4_roof_ncu \
      python ml_training_v4_roofline_gap.py
@@ -192,7 +214,7 @@ python ml_training_cuda.py
 
 and profiling it with `nsys`
 ```
-nsys profile --trace=cuda,nvtx,osrt --stats=true -o ml_report python ml_training_cuda.py
+nsys profile $NSYS_FLAGS --stats=true -o ml_report python ml_training_cuda.py
 ```
 
 Open the generated report `ml_report.nsys-rep` with `nsys-ui`
@@ -211,8 +233,8 @@ ncu --set full --launch-skip 4 --launch-count 8 -o baseline_ncu \
 ## Anti-pattern 1 - Blocking I/O (`v1_io_gaps.py`)
 
 **What is broken:** `json.dump()` + `os.fsync()` called inside every batch loop.
-`loss_val.get()` synchronises the stream first; then the disk write stalls the CPU;
-the GPU sits idle the whole time.
+`loss_val.get()` synchronises the stream first; then the disk write stalls the
+CPU; the GPU sits completely idle during each write.
 
 **nsys - what to look for:**
 1. Open `v1_io.nsys-rep` with `nsys-ui v1_io.nsys-rep` → Timeline view.
@@ -226,7 +248,8 @@ the GPU sits idle the whole time.
 6. In the **OS Runtime** row: `write` + `fsync` syscalls match each void.
 
 **Baseline comparison:** In `baseline.nsys-rep` the kernel bars are essentially
-continuous with gaps < 50 µs between batches.
+continuous with gaps < 50 µs between batches, and the SM Active / Tensor Core
+Activity charts remain consistently high throughout.
 
 **The fix:**
 ```python
@@ -247,7 +270,7 @@ loss_np = float((epoch_loss_gpu / n_batches).get()[0])
 **What is broken:** `batch_size=32`, `H1=64`, `H2=32`.  The layer-1 forward GEMM
 `(32, 512) @ (512, 64)` generates only **1 tile** — 1 of the SMs works, the rest sit idle.
 
-**Rule of thumb (128×128 tile):**
+**Rule of thumb (A100, 108 SMs, 128×128 tile):**
 ```
 tiles = ceil(M/128) × ceil(N/128)
       = ceil(batch/128) × ceil(H1/128)
@@ -262,6 +285,7 @@ Good:         ceil(4096/128) × ceil(4096/128) = 32 × 32 = 1024 tiles → ~9.5 
 ncu --metrics \
   launch__grid_size,\
   launch__block_size,\
+  launch__waves_per_multiprocessor,\
   sm__warps_active.avg.pct_of_peak_sustained_active,\
   sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_active \
   python ml_training_v2_sm_underutil.py
@@ -273,7 +297,15 @@ ncu --metrics \
   bandwidth-limited, not compute-limited; simply not enough parallelism to
   reach either ceiling.
 
-**The fix:** ensure `batch × H1 ≥ n_SMs × tile²`.
+**nsys GPU Metrics — what to look for:**
+  In the **GPU Metrics** rows in nsys-ui, compare v2 vs baseline side by side:
+  - **SM Active** chart: sustained low value in v2 vs high in baseline
+  - **Tensor Core Activity** chart: sporadic low spikes in v2 vs sustained
+    high activity in baseline — each spike corresponds to one tiny GEMM
+    finishing almost instantly before the GPU goes idle again waiting for
+    the next kernel launch
+
+**The fix:**
 ```python
 # BAD:  batch=32,   H1=64   →    1 tile  (1 SM active out of 108)
 # OK:   batch=2048, H1=1024 →  128 tiles (~1.2 SM waves, marginal on A100)
@@ -310,6 +342,7 @@ much larger because fp16 Tensor Cores deliver 125–312 TFLOP/s.
 
 **ncu — what to look for:**
 ```bash
+# Per-precision Tensor Core activity (A100 3rd-gen specific metrics)
 ncu --metrics \
   sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_active,\
   sm__pipe_tensor_op_dmma_cycles_active.avg.pct_of_peak_sustained_active \
@@ -330,6 +363,13 @@ ncu --metrics \
 - The relevant ceiling is the **FP64 TC roof at 19.5 TFLOP/s**.
 - The TF32 roof (156) and FP16 roof (312) will be visible but unreachable —
   the chart makes the 8–16× headroom immediately apparent.
+
+**nsys GPU Metrics — what to look for:**
+  - **Tensor Core Activity** chart: present but low — FP64 TC is active but
+    running at 19.5 TFLOP/s vs 156 TFLOP/s for TF32. Compare directly with
+    the baseline report: the chart height will be visibly lower in v3.
+  - This is the continuous-time complement to ncu's per-kernel
+    `sm__pipe_tensor_op_dmma_cycles_active` metric.
 
 **The fix:**
 ```python
@@ -371,11 +411,18 @@ Result: far from both roofs.
 3. In **"CUDA API Statistics"**: `cudaMemcpy` total time >> kernel total time.
 4. The ratio of DMA time to kernel time directly quantifies the wasted epoch
    time on PCIe transfers.
+5. In the **GPU Metrics** rows:
+   - **SM Active** and **Tensor Core Activity**: drop to 0% during each H→D
+     transfer — the GPU is completely idle while data crosses PCIe.
+   - **Memory Bandwidth** (if shown): during the compute phase, HBM2e
+     utilisation will be lower than the baseline because data arriving from
+     PCIe bypasses the L2 cache, reducing effective reuse.
 
 **ncu — what to look for:**
 ```bash
 ncu --metrics \
   dram__bytes.sum,\
+  dram__bytes_read.sum,\
   sm__cycles_elapsed.avg,\
   l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum.per_second \
   python ml_training_v4_roofline_gap.py
