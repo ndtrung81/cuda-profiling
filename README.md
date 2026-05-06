@@ -144,8 +144,7 @@ synthetic regression data.
 NSYS_FLAGS="--trace=cuda,nvtx,cudnn,cublas \
             --cuda-memory-usage=true \
             --gpu-metrics-device=all \
-            --force-overwrite=true \
-            --delay=10"
+            --force-overwrite=true"
             
 
 | Flag | What it adds |
@@ -158,11 +157,11 @@ NSYS_FLAGS="--trace=cuda,nvtx,cudnn,cublas \
 | `--delay=10` | Collection start after 10 seconds delay to exclude the warming up stage |
 
 # Baseline
-nsys profile --trace=cuda,nvtx,osrt --stats=true -o baseline \
+nsys profile --trace=cuda,nvtx,cublas,osrt --cuda-memory-usage=true --gpu-metrics-device=all --stats=true -o baseline \
      python ml_training_cuda.py
 
 # Anti-pattern 1 - I/O gaps
-nsys profile $NSYS_FLAGS --trace=cuda,nvtx,cudnn,cublas,osrt -o v1_io \
+nsys profile $NSYS_FLAGS -o v1_io \
      python ml_training_v1_io_gaps.py
 
 # Anti-pattern 2 - SM underutilisation
