@@ -245,7 +245,11 @@ CPU; the GPU sits completely idle during each write.
    ```
 4. The NVTX row shows red **"BLOCKING CKPT N"** ranges aligned with each void.
 5. In **"CUDA API Statistics"**: `cudaStreamSynchronize` has very high total time.
-6. In the **OS Runtime** row: `write` + `fsync` syscalls match each void.
+6. In the **OS Runtime** row (visible because `osrt` is in the trace): `write`
+   and `fsync` syscalls align exactly with each grey void.
+7. In the **GPU Metrics** rows: the **SM Active** and **Tensor Core Activity**
+   charts will drop to 0% during each void — confirming the GPU is completely
+   idle while the CPU is doing I/O.
 
 **Baseline comparison:** In `baseline.nsys-rep` the kernel bars are essentially
 continuous with gaps < 50 µs between batches, and the SM Active / Tensor Core
