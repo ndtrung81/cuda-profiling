@@ -3,22 +3,23 @@ ml_training_v3_no_tensor_cores.py  —  ANTI-PATTERN 3: dtype/dims that bypass T
 ===========================================================================================
 WHAT IS BROKEN
 --------------
-Two independent mistakes combine to prevent Tensor Core utilisation:
+Two independent mistakes combine to prevent optimal Tensor Core utilisation:
 
   (a) Weights and activations are stored as float64 (double precision).
-      Tensor Cores on GP100 (Pascal) support only fp16 accumulation.
-      On Volta+ they support fp16, bf16, tf32, and int8 — but NOT fp64.
-      cuBLAS falls back to a scalar FP64 CUDA core DGEMM kernel.
+      On A100, cuBLAS dispatches a DGEMM kernel using the FP64 Tensor Cores
+      at 19.5 TFLOP/s — versus TF32 Tensor Cores at 156 TFLOP/s (automatic
+      for fp32 inputs) or FP16 Tensor Cores at 312 TFLOP/s.  That is an
+      8–16× throughput penalty.
 
   (b) Hidden dimensions are not multiples of 8 (H1=100, H2=60).
-      Even if you use fp16/tf32, Tensor Cores require M, N, K all to be
-      multiples of 8 (fp16) or 4 (tf32/bf16).  Odd sizes force cuBLAS to
-      split the GEMM and handle the remainder with scalar code, or avoid
-      Tensor Core paths entirely.
+      TF32/FP16 Tensor Cores require M, N, K to be multiples of 4 (tf32)
+      or 8 (fp16/bf16) for full tile efficiency.  Non-aligned sizes force
+      cuBLAS to handle remainder elements with scalar code or fall back to
+      non-TC GEMM paths entirely.
 
-  The combined effect: every GEMM runs on regular CUDA FP64 cores, which
-  on the GP100 deliver only ~5 TFLOP/s versus ~21 TFLOP/s for FP32 cores
-  and ~84 TFLOP/s peak for FP16 Tensor Cores (Volta+).
+  The combined effect: every GEMM uses the FP64 TC path at 19.5 TFLOP/s
+  instead of TF32 TC at 156 TFLOP/s — leaving 87% of the A100 compute
+  throughput unused.
 
 WHAT YOU WILL SEE IN ncu
 -------------------------
@@ -35,8 +36,8 @@ WHAT YOU WILL SEE IN ncu
       instead of HFMA (fp16) or FFMA (fp32).
 
   Roofline chart:
-    • The FP64 roof is ~5 TFLOP/s on GP100, roughly 4× lower than the FP32
-      roof.  Your operating point will be near the FP64 roof (if arithmetic-
+    • The relevant ceiling is the FP64 TC roof at 19.5 TFLOP/s — roughly
+      8× lower than the TF32 TC roof (156 TFLOP/s) on A100.  Your operating point will be near the FP64 roof (if arithmetic-
       bound) or below it (if memory-bound), but the FP32 and Tensor Core
       roofs will be unreachable.
 
@@ -56,19 +57,17 @@ smsp__sass_thread_inst_executed_op_dfma_pred_on.sum \\
   nsys profile --trace=cuda,nvtx,osrt --stats=true \\
                -o v3_notc python ml_training_v3_no_tensor_cores.py
 
-THE FIX
--------
-  (a) Use float32 (or float16 with mixed-precision) instead of float64.
-      For fp16 Tensor Cores (Volta+):  cast inputs to cp.float16 before matmul.
-      For tf32 Tensor Cores (Ampere+): fp32 inputs are used automatically by
-      cuBLAS when CUBLAS_MATH_MODE=CUBLAS_TF32_TENSOR_OP_MATH.
+THE FIX (for A100)
+------------------
+  (a) Use float32 — TF32 Tensor Cores are enabled by default in cuBLAS 11+
+      for fp32 inputs, so no code change is needed beyond using the right dtype:
+        float64 → FP64 TC → 19.5 TFLOP/s   (this script)
+        float32 → TF32 TC → 156 TFLOP/s    (8× faster, automatic)
+        float16 → FP16 TC → 312 TFLOP/s    (16× faster, explicit cast)
 
-  (b) Align hidden dimensions to multiples of 8 (fp16/tf32) or 64 (optimal):
-      H1=64, 128, 256, 512, 1024 — not 100, 60, 300, etc.
-
-  Note: GP100 (Pascal) does NOT have Tensor Cores at all.  The comparison is
-  most dramatic on Volta (V100) or Ampere (A100) GPUs.  On GP100 the main
-  lesson from this script is the fp64 vs fp32 throughput difference.
+  (b) Align hidden dimensions to multiples of 8 for fp16/tf32, ideally 64:
+        H1=100, H2=60  → non-aligned, partial TC tile use  (this script)
+        H1=1024, H2=512 → multiples of 64, full TC tile efficiency
 """
 
 import time, contextlib
@@ -118,7 +117,7 @@ class LinearLayer:
         with stream:
             # ── ANTI-PATTERN (a): weights stored in float64 ──────────────────
             # cuBLAS will select a DGEMM (double-precision) kernel — no Tensor
-            # Cores, ~4× lower throughput than SGEMM on GP100.
+            # FP64 TC path (19.5 TFLOP/s) instead of TF32 TC (156 TFLOP/s).
             self.W = cp.array(
                 np.random.randn(fan_in, fan_out).astype(np.float64) * std,
                 dtype=cp.float64)

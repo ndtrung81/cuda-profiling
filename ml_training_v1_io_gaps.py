@@ -130,7 +130,7 @@ class MLP:
 
 def mse_loss(pred, target):
     diff = pred - target
-    return (diff * diff).mean(), (2.0 * diff / pred.size)
+    return (diff * diff).mean(), (cp.float32(2.0) * diff / pred.size)
 
 # ── ANTI-PATTERN helper ───────────────────────────────────────────────────────
 CKPT_PATH = "/tmp/ml_ckpt_v1.json"

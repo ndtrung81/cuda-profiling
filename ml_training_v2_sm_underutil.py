@@ -14,11 +14,11 @@ Each tile maps to one SM.  If tiles < number_of_SMs, most SMs sit idle.
 
   Layer 1 forward with this script:
     (32, 512) @ (512, 64)  →  ceil(32/128) × ceil(64/128)  =  1 × 1  =  1 tile
-    → only 1 of 56 SMs does useful work per kernel launch.
+    → only 1 of 108 SMs does useful work per kernel launch.
 
   Layer 1 forward with the baseline (batch=2048, H1=1024):
     (2048, 512) @ (512, 1024) → ceil(2048/128) × ceil(1024/128) = 16×8 = 128 tiles
-    → ~2 waves across all 56 SMs (still not ideal, but far better).
+    → ~1.2 waves across all 108 SMs (marginal).
 
 WHAT YOU WILL SEE IN nsys
 --------------------------
@@ -65,14 +65,14 @@ HOW TO PROFILE
 
 THE FIX
 -------
-  Rule of thumb for GP100 (56 SMs):
-    batch × hidden ≥ 56 × 128 × 2  ≈  14 336 elements per GEMM dimension
+  Rule of thumb for A100 (108 SMs):
+    batch × hidden ≥ 108 × 128 × 2  ≈  27,648 elements per GEMM dimension
   so that cuBLAS generates at least one full wave of tiles across all SMs.
 
   With batch=2048, H1=1024:
-    ceil(2048/128) × ceil(1024/128) = 16 × 8 = 128 tiles → ~2 full SM waves.
+    ceil(2048/128) × ceil(1024/128) = 16 × 8 = 128 tiles → >1 full SM waves.
   With batch=16384, H1=4096 (larger baseline):
-    ceil(16384/128) × ceil(4096/128) = 128 × 32 = 4096 tiles → ~73 SM waves.
+    ceil(16384/128) × ceil(4096/128) = 128 × 32 = 4096 tiles → ~38 SM waves.
 """
 
 import time, contextlib
@@ -163,7 +163,7 @@ class MLP:
 
 def mse_loss(pred, target):
     diff = pred - target
-    return (diff * diff).mean(), (2.0 * diff / pred.size)
+    return (diff * diff).mean(), (cp.float32(2.0) * diff / pred.size)
 
 def _tile_count(M, N, tile=128):
     """How many 128×128 output tiles does cuBLAS need for this GEMM shape?"""
@@ -190,9 +190,9 @@ def train(
     print("=" * 60)
     print(f"  Device    : {cp.cuda.runtime.getDeviceProperties(0)['name'].decode()}")
     print(f"  Batch     : {batch_size}  H1={H1}  H2={H2}")
-    print(f"  L1 fwd GEMM ({batch_size},{n_features})@({n_features},{H1})")
+    print(f"  L1 fwd GEMM ({batch_size},{n_features}) @ ({n_features},{H1})")
     print(f"    → ~{tc_l1_fwd} output tile(s)  (baseline: ~128 tiles)")
-    print(f"    → only {min(tc_l1_fwd, 56)}/56 SMs can work per GEMM launch")
+    print(f"    → only {min(tc_l1_fwd, 108)}/108 SMs can work per GEMM launch")
     print(f"  >>> Expect very low SM utilisation and tiny grid sizes in ncu.")
     print()
 

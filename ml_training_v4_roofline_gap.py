@@ -28,9 +28,9 @@ COMBINED EFFECT ON THE ROOFLINE
   • Extra temporaries add more global mem traffic → AI goes DOWN further.
   • Lower AI means the operating point moves LEFT on the roofline chart,
     deeper into the memory-bandwidth-limited region, far from the compute roof.
-  • But because H↔D is so slow (PCIe ~16 GB/s vs HBM2 ~720 GB/s on GP100),
-    the GPU spends most of its time waiting — so the actual measured bandwidth
-    is also far below the memory bandwidth roof.
+  • PCIe 4.0 at ~64 GB/s is ~31× slower than A100 HBM2e at 2 TB/s — the GPU
+    spends most of each epoch waiting for data, so measured bandwidth is also
+    far below the HBM2e roof.
   • Result: operating point is low on BOTH axes — far from either roof.
 
 WHAT YOU WILL SEE IN nsys
@@ -205,10 +205,10 @@ def train(
     print(f"  Device : {cp.cuda.runtime.getDeviceProperties(0)['name'].decode()}")
     print(f"  Batch  : {batch_size}   Epochs: {epochs}")
     dataset_bytes = n_samples * (n_features + 1) * 4
-    print(f"  Dataset re-uploaded every epoch: {dataset_bytes/1e6:.1f} MB × {epochs} epochs")
+    print(f"  Dataset re-uploaded every epoch via PCIe 4.0: {dataset_bytes/1e6:.1f} MB × {epochs} epochs")
     print(f"  = {dataset_bytes * epochs / 1e6:.1f} MB of avoidable PCIe traffic.")
-    print(f"  >>> nsys: large H→D memcpy bars dominate timeline.")
-    print(f"  >>> ncu roofline: operating point far below memory bandwidth roof.")
+    print(f"  >>> nsys: large H→D memcpy bars dominate timeline; GPU Metrics drop to 0 during transfers.")
+    print(f"  >>> ncu roofline: far below HBM2e bandwidth slope (2 TB/s) and compute roof.")
     print()
 
     rng = np.random.default_rng(42)
